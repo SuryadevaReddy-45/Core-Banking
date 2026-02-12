@@ -1,0 +1,911 @@
+package sisxty;
+import org.junit.jupiter.api.*;
+import java.time.LocalDate;
+import java.time.Period;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+ 
+import static org.junit.jupiter.api.Assertions.*;
+public class AccountOpeningFormValidationTest {
+    enum KycDoc {
+        AADHAAR, PAN, PASSPORT, VOTER_ID, DRIVING_LICENSE, NREGA_CARD;
+ 
+        static KycDoc fromIndex(int idx) {
+            switch (idx) {
+                case 1: return AADHAAR;
+                case 2: return PAN;
+                case 3: return PASSPORT;
+                case 4: return VOTER_ID;
+                case 5: return DRIVING_LICENSE;
+                case 6: return NREGA_CARD;
+                default: throw new IllegalArgumentException("Invalid KYC index: " + idx);
+            }
+        }
+    }
+ 
+    static class ApplicationForm {
+        String fullName;
+        String dob; // supports yyyy-MM-dd or dd-MM-yyyy
+        String email;
+        String phone;
+        String pan;      // optional unless PAN selected
+        String aadhaar;  // optional unless Aadhaar selected
+        String street;
+        String city;
+        String state;
+        String pincode;
+        Set<KycDoc> kycDocs = new LinkedHashSet<>();
+        String accountType; // savings/current
+        Integer openingDeposit; // ₹
+        String additionalNotes;
+        String consent; // yes/no
+ 
+        ApplicationForm copy() {
+            ApplicationForm f = new ApplicationForm();
+            f.fullName = this.fullName;
+            f.dob = this.dob;
+            f.email = this.email;
+            f.phone = this.phone;
+            f.pan = this.pan;
+            f.aadhaar = this.aadhaar;
+            f.street = this.street;
+            f.city = this.city;
+            f.state = this.state;
+            f.pincode = this.pincode;
+            f.kycDocs = new LinkedHashSet<>(this.kycDocs);
+            f.accountType = this.accountType;
+            f.openingDeposit = this.openingDeposit;
+            f.additionalNotes = this.additionalNotes;
+            f.consent = this.consent;
+            return f;
+        }
+    }
+ 
+    static class SubmissionResult {
+        final boolean success;
+        final List<String> errors; // each already prefixed "❌ Submission Failed: ..."
+ 
+        SubmissionResult(boolean success, List<String> errors) {
+            this.success = success;
+            this.errors = errors;
+        }
+ 
+        boolean isSuccess() { return success; }
+        List<String> getErrors() { return errors; }
+ 
+        boolean containsError(String message) {
+            return errors.stream().anyMatch(e -> e.equals(message));
+        }
+ 
+        boolean containsErrorSubstring(String sub) {
+            return errors.stream().anyMatch(e -> e.contains(sub));
+        }
+    }
+ 
+    static class ValidationOptions {
+        LocalDate today = LocalDate.now();
+        int minKycDocsRequired = 1; // default; overridden in TC_031 to 2
+    }
+ 
+    // ===== Validation Engine =====
+    static class Validation {
+ 
+        private static final String ERR_REQ = "❌ Submission Failed: Please complete the required fields marked with *.";
+        private static final String ERR_NAME_LEN   = "❌ Submission Failed: Full Name must be between 3 and 33 characters.";
+        private static final String ERR_NAME_CHARS = "❌ Submission Failed: Full Name must contain letters and spaces only.";
+        private static final String ERR_AGE = "❌ Submission Failed: You must be at least 18 years old.";
+        private static final String ERR_EMAIL = "❌ Submission Failed: Email format is invalid.";
+        private static final String ERR_PHONE = "❌ Submission Failed: Phone number must be 10 digits (numbers only).";
+        private static final String ERR_PHONE_ZERO = "❌ Submission Failed: Phone number must not start with zero";
+        private static final String ERR_PAN = "❌ Submission Failed: PAN format is invalid. Expected: ABCDE1234F.";
+        private static final String ERR_AADHAAR = "❌ Submission Failed: Aadhaar format is invalid.";
+        private static final String ERR_AADHAAR_REQUIRED = "❌ Submission Failed: please enter aadhaar number";
+        private static final String ERR_PINCODE = "❌ Submission Failed: Pincode must be 6 digits.";
+        private static final String ERR_KYC_SELECT = "❌ Submission Failed: Invalid select any 1 KYC Documents";
+        private static final String ERR_ACCTYPE = "❌ Submission Failed: Should enter the provided Account Type";
+        private static final String ERR_DEPOSIT_MIN = "❌ Submission Failed: Opening deposit must be minimum ₹1000.";
+ 
+        static SubmissionResult validate(ApplicationForm f, ValidationOptions opt) {
+            List<String> errors = new ArrayList<>();
+ 
+            // Required baseline fields (*)
+            if (isBlank(f.fullName) || isBlank(f.dob) || isBlank(f.email) || isBlank(f.phone) ||
+                isBlank(f.street) || isBlank(f.city) || isBlank(f.state) ||
+                isBlank(f.pincode) || isBlank(f.accountType) || f.openingDeposit == null || isBlank(f.consent)) {
+                errors.add(ERR_REQ);
+            }
+ 
+            // ===== Updated Full Name: emit at most ONE error in priority order =====
+            if (!isBlank(f.fullName)) {
+                String name = f.fullName.trim();
+ 
+                // Priority 1: length
+                if (name.length() < 3 || name.length() > 33) {
+                    errors.add(ERR_NAME_LEN);
+                } else {
+                    // Priority 2: allowed characters (letters and spaces only)
+                    // Accept single word or multi-word separated by single spaces (no leading/trailing spaces due to trim)
+                    boolean lettersAndSpaces =
+                        name.matches("^[A-Za-z]{3,33}$") ||
+                        name.matches("^[A-Za-z]{1,33}(?: [A-Za-z]{1,33})*$");
+ 
+                    if (!lettersAndSpaces) {
+                        errors.add(ERR_NAME_CHARS);
+                    }
+                }
+            } else {
+                // For blank name, table expects the LENGTH message (TC_008)
+                errors.add(ERR_NAME_LEN);
+            }
+ 
+            // DOB: parse (yyyy-MM-dd first, then dd-MM-yyyy), age >= 18
+            if (!isBlank(f.dob)) {
+                LocalDate birth = parseDateFlexible(f.dob);
+                if (birth == null) {
+                    // unparseable: table scenarios want age failure surfaced in such cases
+                    errors.add(ERR_AGE);
+                } else {
+                    if (Period.between(birth, opt.today).getYears() < 18) {
+                        errors.add(ERR_AGE);
+                    }
+                }
+            }
+ 
+            // Email
+            if (!isBlank(f.email)) {
+                if (!f.email.matches("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$")) {
+                    errors.add(ERR_EMAIL);
+                }
+            }
+ 
+            // Phone
+            if (!isBlank(f.phone)) {
+                if (!f.phone.matches("^[0-9]{10}$")) {
+                    errors.add(ERR_PHONE);
+                } else if (f.phone.startsWith("0")) {
+                    errors.add(ERR_PHONE_ZERO);
+                }
+            }
+ 
+            // PAN (if provided OR if selected in KYC)
+            boolean panSelected = f.kycDocs.contains(KycDoc.PAN);
+            if (panSelected || !isBlank(f.pan)) {
+                if (isBlank(f.pan) || !f.pan.toUpperCase(Locale.ROOT).matches("^[A-Z]{5}[0-9]{4}[A-Z]$")) {
+                    errors.add(ERR_PAN);
+                }
+            }
+ 
+            // Aadhaar (if provided OR if selected in KYC)
+            boolean aadhaarSelected = f.kycDocs.contains(KycDoc.AADHAAR);
+            if (aadhaarSelected) {
+                if (isBlank(f.aadhaar)) {
+                    errors.add(ERR_AADHAAR_REQUIRED);
+                } else if (!f.aadhaar.matches("^[0-9]{12}$")) {
+                    errors.add(ERR_AADHAAR);
+                }
+            } else {
+                if (!isBlank(f.aadhaar) && !f.aadhaar.matches("^[0-9]{12}$")) {
+                    errors.add(ERR_AADHAAR);
+                }
+            }
+ 
+            // Address & Pincode
+            if (!isBlank(f.pincode) && !f.pincode.matches("^[0-9]{6}$")) {
+                errors.add(ERR_PINCODE);
+            }
+ 
+            // KYC selection count
+            if (f.kycDocs == null || f.kycDocs.size() < opt.minKycDocsRequired) {
+                errors.add(ERR_KYC_SELECT);
+            }
+ 
+            // Account type
+            if (!isBlank(f.accountType)) {
+                String t = f.accountType.trim().toLowerCase(Locale.ROOT);
+                if (!(t.equals("savings") || t.equals("current"))) {
+                    errors.add(ERR_ACCTYPE);
+                }
+            }
+ 
+            // Deposit
+            if (f.openingDeposit != null && f.openingDeposit < 1000) {
+                errors.add(ERR_DEPOSIT_MIN);
+            }
+ 
+            // Consent → already covered by required message when blank.
+            // If you want a separate explicit message for "no", add here (table doesn't require).
+ 
+            // De-duplicate errors while preserving order
+            LinkedHashSet<String> uniq = new LinkedHashSet<>(errors);
+            errors.clear();
+            errors.addAll(uniq);
+ 
+            return new SubmissionResult(errors.isEmpty(), errors);
+        }
+ 
+        private static boolean isBlank(String s) {
+            return s == null || s.trim().isEmpty();
+        }
+ 
+        private static LocalDate parseDateFlexible(String s) {
+            if (isBlank(s)) return null;
+            List<DateTimeFormatter> fmts = Arrays.asList(
+                DateTimeFormatter.ofPattern("yyyy-MM-dd"),
+                DateTimeFormatter.ofPattern("dd-MM-yyyy")
+            );
+            for (DateTimeFormatter fmt : fmts) {
+                try {
+                    return LocalDate.parse(s.trim(), fmt);
+                } catch (DateTimeParseException ignored) {}
+            }
+            return null;
+        }
+    }
+ 
+    // ===== Test Helpers =====
+ 
+    private static ApplicationForm validBaseline() {
+        ApplicationForm f = new ApplicationForm();
+        f.fullName = "Dheeraj Kumar";
+        f.dob = "2000-01-01";
+        f.email = "user@example.com";
+        f.phone = "9123456789";
+        f.pan = "ABCDE1234F";
+        f.aadhaar = "123456789012";
+        f.street = "123 Street";
+        f.city = "Nizamabad";
+        f.state = "Telangana";
+        f.pincode = "503001";
+        f.kycDocs = new LinkedHashSet<>(Arrays.asList(KycDoc.AADHAAR, KycDoc.PAN));
+        f.accountType = "savings";
+        f.openingDeposit = 8000;
+        f.additionalNotes = "hi";
+        f.consent = "yes";
+        return f;
+    }
+ 
+    private static SubmissionResult run(ApplicationForm form) {
+        ValidationOptions opt = new ValidationOptions();
+        opt.today = LocalDate.of(2026, 2, 11); // Freeze to match scenarios' "today"
+        return Validation.validate(form, opt);
+    }
+ 
+    private static SubmissionResult run(ApplicationForm form, java.util.function.Consumer<ValidationOptions> cfg) {
+        ValidationOptions opt = new ValidationOptions();
+        opt.today = LocalDate.of(2026, 2, 11);
+        cfg.accept(opt);
+        return Validation.validate(form, opt);
+    }
+ 
+    // ===== TS_001: Full Name boundary & allowed characters =====
+ 
+    @Test @DisplayName("TS_001 TC_001: Valid full name (e.g., 'Dheeraj')")
+    void TC_001() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "Dheeraj";
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_001 TC_002: Valid full name (e.g., 'Ram')")
+    void TC_002() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "Ram";
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_001 TC_003: Full name length < 3 (e.g., 'Hi') → fail")
+    void TC_003() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "Hi";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Full Name must be between 3 and 33 characters."));
+    }
+ 
+    @Test @DisplayName("TS_001 TC_004: Full name length > 33 → fail")
+    void TC_004() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "Vera Raja vere king of telangana state"; // > 33
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Full Name must be between 3 and 33 characters."));
+    }
+ 
+    @Test @DisplayName("TS_001 TC_005: Full name digits only → fail (letters/spaces only)")
+    void TC_005() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "12345";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Full Name must contain letters and spaces only."));
+    }
+ 
+    @Test @DisplayName("TS_001 TC_006: Full name special chars → fail")
+    void TC_006() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "@#$%";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Full Name must contain letters and spaces only."));
+    }
+ 
+    @Test @DisplayName("TS_001 TC_007: Full name with letters+digits/specials → fail")
+    void TC_007() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "Dheeraj@123";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Full Name must contain letters and spaces only."));
+    }
+ 
+    @Test @DisplayName("TS_001 TC_008: Full name blank/null → fail (length msg)")
+    void TC_008() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "   ";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Full Name must be between 3 and 33 characters."));
+    }
+ 
+    // ===== TS_002: Age >= 18 validation =====
+ 
+    @Test @DisplayName("TS_002 TC_009: DOB in future (2025-10-08) → fail age")
+    void TC_009() {
+        ApplicationForm f = validBaseline();
+        f.dob = "2025-10-08";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: You must be at least 18 years old."));
+    }
+ 
+    @Test @DisplayName("TS_002 TC_010: DOB 2007-10-08 → age ≥ 18 on 2026-02-11 → pass")
+    void TC_010() {
+        ApplicationForm f = validBaseline();
+        f.dob = "2007-10-08";
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_002 TC_011: DOB blank → required fields fail")
+    void TC_011() {
+        ApplicationForm f = validBaseline();
+        f.dob = " ";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Please complete the required fields marked with *."));
+    }
+ 
+    @Test @DisplayName("TS_002 TC_012: DOB 2008-02-01 → turns 18 by 2026-02-11 → pass")
+    void TC_012() {
+        ApplicationForm f = validBaseline();
+        f.dob = "2008-02-01";
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_002 TC_013: DOB '08-10-2008' (dd-MM-yyyy) → parsed & under-18 → fail")
+    void TC_013() {
+        ApplicationForm f = validBaseline();
+        f.dob = "08-10-2008";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: You must be at least 18 years old."));
+    }
+ 
+    // ===== TS_003: Email validation =====
+ 
+    @Test @DisplayName("TS_003 TC_014: Email 'smile.com' → invalid")
+    void TC_014() {
+        ApplicationForm f = validBaseline();
+        f.email = "smile.com";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Email format is invalid."));
+    }
+ 
+    @Test @DisplayName("TS_003 TC_015: Email blank → required")
+    void TC_015() {
+        ApplicationForm f = validBaseline();
+        f.email = "";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Please complete the required fields marked with *."));
+    }
+ 
+    @Test @DisplayName("TS_003 TC_016: Valid email → pass")
+    void TC_016() {
+        ApplicationForm f = validBaseline();
+        f.email = "siri@gmail.com";
+        f.phone = "7897645321";
+        f.fullName = "Siri";
+        f.dob = "2008-02-01"; // 18y+ on test date
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_003 TC_017: Email 'friya#.com' → invalid")
+    void TC_017() {
+        ApplicationForm f = validBaseline();
+        f.email = "friya#.com";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Email format is invalid."));
+    }
+ 
+    @Test @DisplayName("TS_003 TC_018: Email 'S23$.com' → invalid")
+    void TC_018() {
+        ApplicationForm f = validBaseline();
+        f.email = "S23$.com";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Email format is invalid."));
+    }
+ 
+    @Test @DisplayName("TS_003 TC_019: Email 'flash@gmail.com' → pass")
+    void TC_019() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "FlashMan";
+        f.email = "flash@gmail.com";
+        f.phone = "8762341682";
+        f.street = "Ynagar";
+        f.city = "Karnataka";
+        f.state = "Karnataka";
+        f.pincode = "509176";
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.PASSPORT));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_003 TC_020: Email 'santhu@.com' → invalid")
+    void TC_020() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "SanthoshReddy";
+        f.email = "santhu@.com";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Email format is invalid."));
+    }
+ // ===== TS_004: Phone number validation =====
+ 
+    @Test @DisplayName("TS_004 TC_021: Correct 10-digit phone → pass")
+    void TC_021() {
+        ApplicationForm f = validBaseline();
+        f.phone = "9701257902";
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_004 TC_022: Phone with a letter → invalid")
+    void TC_022() {
+        ApplicationForm f = validBaseline();
+        f.phone = "9a01257902";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Phone number must be 10 digits (numbers only)."));
+    }
+ 
+    @Test @DisplayName("TS_004 TC_023: Phone starts with 0 → invalid")
+    void TC_023() {
+        ApplicationForm f = validBaseline();
+        f.phone = "0923658798";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Phone number must not start with zero"));
+    }
+ 
+    @Test @DisplayName("TS_004 TC_024: Phone includes spaces → invalid")
+    void TC_024() {
+        ApplicationForm f = validBaseline();
+        f.phone = "9701  257902";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Phone number must be 10 digits (numbers only)."));
+    }
+ 
+    @Test @DisplayName("TS_004 TC_025: Phone < 10 digits → invalid")
+    void TC_025() {
+        ApplicationForm f = validBaseline();
+        f.phone = "9701257";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Phone number must be 10 digits (numbers only)."));
+    }
+ 
+    @Test @DisplayName("TS_004 TC_026: Phone > 10 digits → invalid")
+    void TC_026() {
+        ApplicationForm f = validBaseline();
+        f.phone = "9701257897887";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Phone number must be 10 digits (numbers only)."));
+    }
+ 
+    @Test @DisplayName("TS_004 TC_027: Phone blank → required")
+    void TC_027() {
+        ApplicationForm f = validBaseline();
+        f.phone = " ";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Please complete the required fields marked with *."));
+    }
+ 
+    // ===== TS_005: PAN & Aadhaar validation =====
+ 
+    @Test @DisplayName("TS_005 TC_028: Valid PAN pattern → pass")
+    void TC_028() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "AYYAPPA";
+        f.dob = "1010-01-14";
+        f.email = "ayyappa@gmail.com";
+        f.phone = "8283651234";
+        f.pan = "SWAMI1415M";
+        f.aadhaar = "723461789198";
+        f.street = "sabarimala";
+        f.city = "kerla";
+        f.state = "Hindustan";
+        f.pincode = "500101";
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.NREGA_CARD));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_005 TC_029: PAN wrong structure → invalid")
+    void TC_029() {
+        ApplicationForm f = validBaseline();
+        f.pan = "RAAM1111R";
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.PAN)); // PAN selected
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: PAN format is invalid. Expected: ABCDE1234F."));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_030: PAN too short → invalid")
+    void TC_030() {
+        ApplicationForm f = validBaseline();
+        f.pan = "A";
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.PAN));
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: PAN format is invalid. Expected: ABCDE1234F."));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_031: Only Aadhaar selected (min docs=2 for this test) → KYC rule not satisfied")
+    void TC_031() {
+        ApplicationForm f = validBaseline();
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.AADHAAR));
+        // Aadhaar present and valid; PAN blank/spaces
+        f.pan = "    ";
+        f.aadhaar = "762345619812";
+        SubmissionResult r = run(f, opts -> opts.minKycDocsRequired = 2);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Invalid select any 1 KYC Documents"));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_032: PAN has special char → invalid")
+    void TC_032() {
+        ApplicationForm f = validBaseline();
+        f.pan = "ASDFG@123W";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: PAN format is invalid. Expected: ABCDE1234F."));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_033: PAN wrong final letter placement → invalid")
+    void TC_033() {
+        ApplicationForm f = validBaseline();
+        f.pan = "AAAAA111AA";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: PAN format is invalid. Expected: ABCDE1234F."));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_034: Valid Aadhaar (12 digits) → pass")
+    void TC_034() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "Komire Manideep";
+        f.dob = "2007-03-06";
+        f.email = "manideepkomire@gmail.com";
+        f.phone = "6309846212";
+        f.pan = "QDNPK1310M";
+        f.aadhaar = "527222377706";
+        f.street = "Park enclave";
+        f.city = "Hyderabad";
+        f.state = "Telangana";
+        f.pincode = "504251";
+        f.kycDocs = new LinkedHashSet<>(Arrays.asList(KycDoc.AADHAAR, KycDoc.PAN));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_005 TC_035: Aadhaar with special char → invalid")
+    void TC_035() {
+        ApplicationForm f = validBaseline();
+        f.aadhaar = "5272-2237&7706";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Aadhaar format is invalid."));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_036: Aadhaar with spaces → invalid")
+    void TC_036() {
+        ApplicationForm f = validBaseline();
+        f.aadhaar = "5272 2237 7706";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Aadhaar format is invalid."));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_037: Aadhaar less than 12 digits → invalid")
+    void TC_037() {
+        ApplicationForm f = validBaseline();
+        f.aadhaar = "52722237770";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Aadhaar format is invalid."));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_038: Aadhaar greater than 12 digits → invalid")
+    void TC_038() {
+        ApplicationForm f = validBaseline();
+        f.aadhaar = "5272223777062";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Aadhaar format is invalid."));
+    }
+ 
+    @Test @DisplayName("TS_005 TC_039: Aadhaar selected but number blank → explicit Aadhaar required")
+    void TC_039() {
+        ApplicationForm f = validBaseline();
+        f.aadhaar = " ";
+        f.kycDocs = new LinkedHashSet<>(Arrays.asList(KycDoc.AADHAAR, KycDoc.PAN));
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: please enter aadhaar number"));
+    }
+ 
+    // ===== TS_006: Address & Pincode =====
+ 
+    @Test @DisplayName("TS_006 TC_040: Valid address + pincode → pass")
+    void TC_040() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "Ram";
+        f.dob = "2006-07-08";
+        f.email = "ram@gmail.com";
+        f.phone = "8074695313";
+        f.pan = "ASDFG4343Q";
+        f.aadhaar = "883456196534";
+        f.street = "Ramnagar";
+        f.city = "Kazipet";
+        f.state = "Telangana";
+        f.pincode = "500601";
+        f.kycDocs = new LinkedHashSet<>(Arrays.asList(KycDoc.PAN, KycDoc.PASSPORT));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_006 TC_041: Pincode alpha → invalid")
+    void TC_041() {
+        ApplicationForm f = validBaseline();
+        f.pincode = "ASDFGH";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Pincode must be 6 digits."));
+    }
+ 
+    @Test @DisplayName("TS_006 TC_042: Pincode with special char → invalid")
+    void TC_042() {
+        ApplicationForm f = validBaseline();
+        f.pincode = "1234@1";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Pincode must be 6 digits."));
+    }
+ 
+    @Test @DisplayName("TS_006 TC_043: Pincode blank → required")
+    void TC_043() {
+        ApplicationForm f = validBaseline();
+        f.pincode = "   ";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Please complete the required fields marked with *."));
+    }
+ 
+    @Test @DisplayName("TS_006 TC_044: Street/City/State blank → required")
+    void TC_044() {
+        ApplicationForm f = validBaseline();
+        f.street = " ";
+        f.city = " ";
+        f.state = " ";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Please complete the required fields marked with *."));
+    }
+ 
+    // ===== TS_007: KYC selection =====
+ 
+    @Test @DisplayName("TS_007 TC_045: KYC Aadhaar + PAN → pass")
+    void TC_045() {
+        ApplicationForm f = validBaseline();
+        f.kycDocs = new LinkedHashSet<>(Arrays.asList(KycDoc.AADHAAR, KycDoc.PAN));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_007 TC_046: KYC 3,4,5,6 → pass")
+    void TC_046() {
+        ApplicationForm f = validBaseline();
+        f.kycDocs = new LinkedHashSet<>(Arrays.asList(KycDoc.PASSPORT, KycDoc.VOTER_ID, KycDoc.DRIVING_LICENSE, KycDoc.NREGA_CARD));
+        // Since Aadhaar/PAN not selected, their numbers aren't required
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_007 TC_047: KYC single Voter ID → pass (min=1 default)")
+    void TC_047() {
+        ApplicationForm f = validBaseline();
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.VOTER_ID));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_007 TC_048: KYC null selection → invalid")
+    void TC_048() {
+        ApplicationForm f = validBaseline();
+        f.kycDocs = new LinkedHashSet<>();
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Invalid select any 1 KYC Documents"));
+    }
+ 
+    // ===== TS_008: Account Type selection =====
+ 
+    @Test @DisplayName("TS_008 TC_049: Account type blank → required")
+    void TC_049() {
+        ApplicationForm f = validBaseline();
+        f.accountType = " ";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Please complete the required fields marked with *."));
+    }
+ 
+    @Test @DisplayName("TS_008 TC_050: Account type 'savings' → pass")
+    void TC_050() {
+        ApplicationForm f = validBaseline();
+        f.accountType = "savings";
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.VOTER_ID));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_008 TC_051: Account type invalid value → fail")
+    void TC_051() {
+        ApplicationForm f = validBaseline();
+        f.accountType = "345";
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.DRIVING_LICENSE));
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Should enter the provided Account Type"));
+    }
+ 
+    @Test @DisplayName("TS_008 TC_052: Account type 'current' → pass")
+    void TC_052() {
+        ApplicationForm f = validBaseline();
+        f.accountType = "current";
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.NREGA_CARD));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    // ===== TS_009: Opening deposit minimum =====
+ 
+    @Test @DisplayName("TS_009 TC_053: Savings deposit 999 < 1000 → fail")
+    void TC_053() {
+        ApplicationForm f = validBaseline();
+        f.accountType = "savings";
+        f.openingDeposit = 999;
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Opening deposit must be minimum ₹1000."));
+    }
+ 
+    @Test @DisplayName("TS_009 TC_054: Current deposit 99 < 1000 → fail")
+    void TC_054() {
+        ApplicationForm f = validBaseline();
+        f.accountType = "current";
+        f.openingDeposit = 99;
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Opening deposit must be minimum ₹1000."));
+    }
+ 
+    @Test @DisplayName("TS_009 TC_055: Savings deposit 9000 → pass")
+    void TC_055() {
+        ApplicationForm f = validBaseline();
+        f.accountType = "savings";
+        f.openingDeposit = 9000;
+        f.kycDocs = new LinkedHashSet<>(Arrays.asList(KycDoc.PAN, KycDoc.PASSPORT));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_009 TC_056: Current deposit 9000 → pass")
+    void TC_056() {
+        ApplicationForm f = validBaseline();
+        f.accountType = "current";
+        f.openingDeposit = 9000;
+        f.kycDocs = new LinkedHashSet<>(Arrays.asList(KycDoc.PAN, KycDoc.PASSPORT));
+        SubmissionResult r = run(f);
+        assertTrue(r.isSuccess());
+    }
+ 
+    @Test @DisplayName("TS_009 TC_057: Deposit 0 → fail")
+    void TC_057() {
+        ApplicationForm f = validBaseline();
+        f.openingDeposit = 0;
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Opening deposit must be minimum ₹1000."));
+    }
+ 
+    // ===== TC_010: Unhandled / Unexpected inputs =====
+ 
+    @Test @DisplayName("TC_010 TC_058: All required fields blank, consent 'no' → required")
+    void TC_058() {
+        ApplicationForm f = new ApplicationForm(); // everything null/blank
+        f.openingDeposit = null;
+        f.consent = "no";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Please complete the required fields marked with *."));
+    }
+ 
+    @Test @DisplayName("TC_010 TC_059: Gibberish inputs → age and other failures (assert at least age msg)")
+    void TC_059() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "###";
+        f.dob = "########"; // unparseable; we add age error
+        f.email = "#########";
+        f.phone = "##########";
+        f.pan = "############";
+        f.aadhaar = "##########";
+        f.street = "############";
+        f.city = "#############";
+        f.state = "###############";
+        f.pincode = "################";
+        f.kycDocs = new LinkedHashSet<>(); // invalid
+        f.accountType = "#";
+        f.openingDeposit = 10000;
+        f.additionalNotes = "######";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        // In this tortured case, ensure age failure is reported per expected note
+        assertTrue(r.containsError("❌ Submission Failed: You must be at least 18 years old."));
+    }
+ 
+    @Test @DisplayName("TC_010 TC_060: Mixed invalids, ensure email error shown")
+    void TC_060() {
+        ApplicationForm f = validBaseline();
+        f.fullName = "$%#@!";         // invalid name
+        f.dob = "2000-01-09";         // valid age
+        f.email = "ASHE@@@@@@@";      // invalid email
+        f.phone = "1762452167";       // valid 10-digit not starting 0 → OK
+        f.pan = "AAAAA!@#$D";         // invalid PAN if selected
+        f.aadhaar = "987612#45589";   // invalid Aadhaar if selected
+        f.street = "tyui";
+        f.city = "hjkl";
+        f.state = "hjkl";
+        f.pincode = "876123";
+        f.kycDocs = new LinkedHashSet<>(Collections.singletonList(KycDoc.PAN)); // forces PAN validation
+        f.accountType = "savings";
+        f.openingDeposit = 8000;
+        f.consent = "yes";
+        SubmissionResult r = run(f);
+        assertFalse(r.isSuccess());
+        assertTrue(r.containsError("❌ Submission Failed: Email format is invalid."));
+    }
+}
+ 
+ 
